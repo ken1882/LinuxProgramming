@@ -1,0 +1,6 @@
+makefile
+*~
+*.o
+*test*
+out*
+sponge
