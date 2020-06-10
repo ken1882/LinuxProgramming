@@ -32,9 +32,40 @@ const int IOR_NONE = 0;
 const int IOR_OUT  = 1;
 const int IOR_APP  = 2;
 const int IOR_IN   = 3;
+const int IOR_PIPE = 4;
+
+struct ProcInfo{
+    std::string pname;
+    std::string ppath;
+    std::vector<std::string> args;
+    int file_flag;
+    int io_flag;
+
+    ProcInfo(std::string pn, std::vector<std::string> _args,
+             int fflag, int iflag)
+    {
+        pname = pn;
+        args  = _args;
+        file_flag = fflag;
+        io_flag   = iflag;
+    }
+};
 
 void sig_handler(int signo){
     std::cout << "Recived singal " << signo << '\n';
+}
+
+std::string get_cwd(){
+    char buffer[0xfff];
+    std::string ret = "";
+    if(getcwd(buffer, sizeof(buffer)) != NULL){
+        ret = buffer;
+    }
+    else{
+        std::cout << "An error occurred during getting pwd!\n";
+        std::cout << strerror(errno) << '\n';
+    }
+    return ret;
 }
 
 std::vector<std::string> get_PATH(){
@@ -52,10 +83,11 @@ std::vector<std::string> get_PATH(){
     if(str.length() > 1){
         ret.push_back(str);
     }
+    ret.push_back(get_cwd());
     return ret;
 }
 
-int find_program(std::string pname, std::string& out){
+bool find_program(std::string pname, std::string& out){
     auto paths = get_PATH();
     bool found = false;
     for(auto path:paths){
@@ -74,7 +106,7 @@ int find_program(std::string pname, std::string& out){
         }
         if(found){break;}
     }
-    return found ? 0 : 1;
+    return found;
 }
 
 pii fork_and_pipe(int& pid_out){
@@ -88,52 +120,40 @@ pii fork_and_pipe(int& pid_out){
     return std::make_pair(_pipes[0], _pipes[1]);
 }
 
-int execute(std::string path, std::vector<std::string> args, int p_out, int p_in){
-    int main_pipe[2];
-    if(pipe(main_pipe) == -1){
-        std::cout << "An error occurred during creating pipe\n";
-        std::cout << (strerror(errno)) << '\n';
-        return 1;
+// Should only be called by child process
+void execute_program(std::string path, std::vector<std::string> args,
+             int p_out, int p_in){
+
+    std::vector<char*> arr;
+    std::transform(
+        std::cbegin(args), std::cend(args), std::back_inserter(arr),
+        [](auto& str){ return const_cast<char*>(str.c_str()); }
+    );
+    arr.push_back(NULL);
+    const std::vector<char*> const_arr(arr);
+    char* const* child_argv = const_arr.data();
+
+    close(STDOUT_FILENO);
+    if(p_out >= 0){dup2(p_out, STDOUT_FILENO);}
+    close(STDIN_FILENO);
+    if(p_in >= 0){dup2(p_in, STDIN_FILENO);}
+    execv(path.c_str(), child_argv);
+
+    printf("Child process failed to execute command, aborting\n");
+    exit(1);
+}
+
+void read_final_output(int p_in, int p_out){
+    close(p_out);
+    char buffer[0xffff] = {0};
+    int nbytes = 0;
+    while((nbytes = read(p_in, buffer,
+                         sizeof(buffer)-sizeof(char)))
+         ){
+        buffer[nbytes] = '\0';
+        std::cout << buffer << '\n';
     }
-
-    pid_t pid;
-    pid = fork();
-
-    if(pid == 0){
-        std::vector<char*> arr;
-        std::transform(
-            std::cbegin(args), std::cend(args), std::back_inserter(arr),
-            [](auto& str){ return const_cast<char*>(str.c_str()); }
-        );
-        arr.push_back(NULL);
-        const std::vector<char*> const_arr(arr);
-        char* const* child_argv = const_arr.data();
-
-        close(STDOUT_FILENO);
-        dup2(main_pipe[1], STDOUT_FILENO);
-        close(STDIN_FILENO);
-
-        execv(path.c_str(), child_argv);
-
-        printf("Child process failed to execute command, aborting\n");
-        exit(1);
-    }
-    else if(pid < 0){
-        return -1;
-    }
-    else{
-        close(main_pipe[1]);
-        char buffer[0xffff] = {0};
-        int nbytes = 0;
-        while((nbytes = read(main_pipe[0], buffer,
-                             sizeof(buffer)-sizeof(char)))
-             ){
-            buffer[nbytes] = '\0';
-            std::cout << buffer << '\n';
-        }
-        wait(NULL);
-    }
-    return 0;
+    wait(NULL);
 }
 
 pii determine_flags(int ntoken){
@@ -142,7 +162,6 @@ pii determine_flags(int ntoken){
     case RED_STDOUT:
     case RED_STDIN:
     case APP_STDOUT:
-        new_proc = true;
         file_flag = FILE_TXT;
     }
     switch(ntoken){
@@ -153,11 +172,65 @@ pii determine_flags(int ntoken){
     case APP_STDOUT:
         io_flag = IOR_APP; break;
     case SYM_PIPE:
-        new_proc  = true;
         file_flag = FILE_ELF;
-        io_flag   = IOR_OUT;
+        io_flag   = IOR_PIPE;
     }
     return std::make_pair(file_flag, io_flag);
+}
+
+int generate_proc_info(std::string pname, std::vector<std::string>& args){
+    std::string ppath;
+    bool found = find_program(pname, ppath);
+    if(!found){
+        printf("Command not found %s\n", pname.c_str());
+        return -1;
+    }
+    args.insert(args.begin(), ppath);
+    return 0;
+}
+
+void execute_command(std::vector<ProcInfo> proces)
+{
+    int plen = proces.size();
+    std::vector<int> children_pids;
+    pid_t _pid = -1;
+    int cur_pipe[2];
+    int p_in = -1, p_out = -1;
+    std::string pname;
+    std::vector<std::string> args;
+    int idx = 0;
+    while(idx < plen){
+        pname = proces[idx].pname;
+        args  = proces[idx].args;
+        if(proces[idx].file_flag == FILE_ELF){
+            int err = generate_proc_info(pname, args);
+            if(err == -1){return ;}
+            proces[idx].ppath = args[0];
+            proces[idx].args  = args;
+
+        }
+        else if(proces[idx].file_flag == FILE_TXT){
+
+        }
+
+        if(FLAG_DEBUG){
+            if(proces[idx].file_flag == FILE_ELF){
+                printf("Running %s(%s) with args:\n", pname.c_str(), proces[idx].ppath.c_str());
+                for(auto arg:proces[idx].args){
+                    std::cout << arg << ' ';
+                }
+            }
+            else if(proces[idx].file_flag == FILE_TXT){
+                printf("Opening file %s\n", pname.c_str());
+            }
+            std::cout << "\n-------\n";
+        }
+        idx++;
+    }
+
+    if(_pid == 0){
+
+    }
 }
 
 void process_input(std::string input){
@@ -207,28 +280,12 @@ void process_input(std::string input){
     }while(ntoken);
     lex_clear_buffer();
     io_flags.push_back(IOR_NONE);
-
+    std::vector<ProcInfo> procs;
     for(int i=0;i<f_len;++i){
-        std::string pname = files[i];
-        auto args = arguments[i];
-        if(FLAG_DEBUG){
-            std::cout << "Running "<< pname << " with args:";
-            for(auto arg:arguments[i]){
-                std::cout << arg << ' ';
-            }
-            std::cout << "\n-------\n";
-        }
-        if(file_flags[i] == FILE_ELF){
-            std::string ppath;
-            int no = find_program(pname, ppath);
-            if(no == -1){
-                std::cout << strerror(errno) << '\n';
-                return ;
-            }
-            args.insert(args.begin(), ppath);
-            fork_execute(ppath, args);
-        }
+        procs.push_back(ProcInfo(files[i], arguments[i],
+                                 file_flags[i], io_flags[i]));
     }
+    execute_command(procs);
 }
 
 std::string get_user_input(){
