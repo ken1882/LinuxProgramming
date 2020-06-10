@@ -28,11 +28,11 @@ bool FLAG_DEBUG   = true;
 
 const int FILE_ELF = 0; // ELF file for executing
 const int FILE_TXT = 1; // Text file for I/O
-const int IOR_NONE = 0;
-const int IOR_OUT  = 1;
-const int IOR_APP  = 2;
-const int IOR_IN   = 3;
-const int IOR_PIPE = 4;
+const int IOR_NONE = 0; // No I/O redirect
+const int IOR_OUT  = 1; // Redirect stdout in overwrite mode
+const int IOR_APP  = 2; // Redirect stdout in append mode
+const int IOR_IN   = 3; // Redirect stdin
+const int IOR_PIPE = 4; // Bi-directional redirect two process
 
 struct ProcInfo{
     std::string pname;
@@ -122,8 +122,15 @@ pii fork_and_pipe(int& pid_out){
 
 // Should only be called by child process
 void execute_program(std::string path, std::vector<std::string> args,
-             int p_out, int p_in){
+             int fd_in, int fd_out){
 
+    if(FLAG_DEBUG){
+        printf("Running %s with args:\n", path.c_str());
+        for(auto arg:args){
+            std::cout << arg << ' ';
+        }
+        std::cout << "\n-------\n";
+    }
     std::vector<char*> arr;
     std::transform(
         std::cbegin(args), std::cend(args), std::back_inserter(arr),
@@ -134,20 +141,22 @@ void execute_program(std::string path, std::vector<std::string> args,
     char* const* child_argv = const_arr.data();
 
     close(STDOUT_FILENO);
-    if(p_out >= 0){dup2(p_out, STDOUT_FILENO);}
-    close(STDIN_FILENO);
-    if(p_in >= 0){dup2(p_in, STDIN_FILENO);}
-    execv(path.c_str(), child_argv);
+    if(fd_in >= 0){
+        close(STDIN_FILENO);
+        dup2(fd_in, STDIN_FILENO);
+    }
+    if(fd_out >= 0){dup2(fd_out, STDOUT_FILENO);}
 
-    printf("Child process failed to execute command, aborting\n");
+    execv(path.c_str(), child_argv);
+    printf("Child process failed to execute process %s\n", path.c_str());
     exit(1);
 }
 
-void read_final_output(int p_in, int p_out){
-    close(p_out);
+void read_final_output(int fd_in, int fd_out){
+    close(fd_out);
     char buffer[0xffff] = {0};
     int nbytes = 0;
-    while((nbytes = read(p_in, buffer,
+    while((nbytes = read(fd_in, buffer,
                          sizeof(buffer)-sizeof(char)))
          ){
         buffer[nbytes] = '\0';
@@ -182,54 +191,65 @@ int generate_proc_info(std::string pname, std::vector<std::string>& args){
     std::string ppath;
     bool found = find_program(pname, ppath);
     if(!found){
-        printf("Command not found %s\n", pname.c_str());
+        printf("Command not found '%s'\n", pname.c_str());
         return -1;
     }
     args.insert(args.begin(), ppath);
     return 0;
 }
 
-void execute_command(std::vector<ProcInfo> proces)
-{
+int transform_proc_info(ProcInfo& proc){
+    auto pname = proc.pname;
+    auto args  = proc.args;
+    if(proc.file_flag == FILE_ELF){
+        int err = generate_proc_info(pname, args);
+        if(err == -1){return -1;}
+        proc.ppath = args[0];
+        proc.args  = args;
+
+    }
+    else if(proc.file_flag == FILE_TXT){
+
+    }
+    return 0;
+}
+
+void execute_command(std::vector<ProcInfo> proces){
     int plen = proces.size();
     std::vector<int> children_pids;
+    std::vector<pii> children_pipes;
     pid_t _pid = -1;
-    int cur_pipe[2];
-    int p_in = -1, p_out = -1;
-    std::string pname;
+    std::string ppath;
     std::vector<std::string> args;
+    int main_pipe[2];
+    if(pipe(main_pipe)){
+        std::cout << "An error occurred during creating pipes\n";
+        std::cout << strerror(errno);
+        return ;
+    }
+    int fd_in = -1, fd_out = -1;
     int idx = 0;
     while(idx < plen){
-        pname = proces[idx].pname;
-        args  = proces[idx].args;
-        if(proces[idx].file_flag == FILE_ELF){
-            int err = generate_proc_info(pname, args);
-            if(err == -1){return ;}
-            proces[idx].ppath = args[0];
-            proces[idx].args  = args;
-
-        }
-        else if(proces[idx].file_flag == FILE_TXT){
-
+        transform_proc_info(proces[idx]);
+        if(proces[idx].io_flag == IOR_NONE){
+            fd_out = main_pipe[1];
         }
 
-        if(FLAG_DEBUG){
-            if(proces[idx].file_flag == FILE_ELF){
-                printf("Running %s(%s) with args:\n", pname.c_str(), proces[idx].ppath.c_str());
-                for(auto arg:proces[idx].args){
-                    std::cout << arg << ' ';
-                }
-            }
-            else if(proces[idx].file_flag == FILE_TXT){
-                printf("Opening file %s\n", pname.c_str());
-            }
-            std::cout << "\n-------\n";
+        children_pipes.push_back(fork_and_pipe(_pid));
+        if(_pid == 0){
+            ppath = proces[idx].ppath;
+            args  = proces[idx].args;
+            break;
         }
         idx++;
     }
 
     if(_pid == 0){
-
+        close(main_pipe[0]);
+        execute_program(ppath, args, fd_in, fd_out);
+    }
+    else{
+        read_final_output(main_pipe[0], main_pipe[1]);
     }
 }
 
