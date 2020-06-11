@@ -16,6 +16,9 @@
 #include <vector>
 #include <algorithm>
 
+#define term_update() printf("\033[H\033[J")
+#define term_gotoxy(x, y) printf("\033[%d;%dH", x, y)
+
 typedef std::pair<int,int> pii;
 
 extern int yylex();
@@ -27,12 +30,15 @@ extern void lex_clear_buffer();
 bool FLAG_RUNNING = true;
 bool FLAG_DEBUG   = true;
 
+int running_children_cnt = 0;
+
 const int FILE_ELF = 0; // ELF file for executing
 const int FILE_TXT = 1; // Text file for I/O
 const int IOR_NONE = 0; // No I/O redirect
 const int IOR_OUT  = 1; // Redirect stdout in overwrite mode
 const int IOR_APP  = 2; // Redirect stdout in append mode
 const int IOR_IN   = 3; // Redirect stdin
+const int IOR_DAEMON = 4; // No I/O and put in background
 const int IOR_PIPE = 0x10; // Bi-directional redirect two process
 
 struct ProcInfo{
@@ -53,7 +59,14 @@ struct ProcInfo{
 };
 
 void sig_handler(int signo){
-    std::cout << "Recived singal " << signo << '\n';
+    if(FLAG_DEBUG){
+        std::cout << "Recived singal " << signo << '\n';
+    }
+    if(signo == SIGCHLD){
+        wait(NULL);
+        running_children_cnt -= 1;
+        printf("Running children: %d\n", running_children_cnt);
+    }
 }
 
 std::string get_cwd(){
@@ -122,7 +135,7 @@ pii create_pipe(){
 
 // Should only be called by child process
 void execute_program(std::string path, std::vector<std::string> args,
-             int fd_in, int fd_out){
+             int fd_in, int fd_out, bool is_daemon=false){
 
     if(FLAG_DEBUG){
         printf("Running %s with args:\n", path.c_str());
@@ -140,15 +153,23 @@ void execute_program(std::string path, std::vector<std::string> args,
     const std::vector<char*> const_arr(arr);
     char* const* child_argv = const_arr.data();
 
-    close(STDOUT_FILENO);
-    if(fd_in >= 0){
-        close(STDIN_FILENO);
-        dup2(fd_in, STDIN_FILENO);
-        close(fd_in);
+    if(is_daemon){
+        if(FLAG_DEBUG){
+            std::cout << "Daemon ran " << path << '\n';
+        }
+        daemon(0, 0);
     }
-    if(fd_out >= 0){
-        dup2(fd_out, STDOUT_FILENO);
-        close(fd_out);
+    else{
+        close(STDOUT_FILENO);
+        if(fd_in >= 0){
+            close(STDIN_FILENO);
+            dup2(fd_in, STDIN_FILENO);
+            close(fd_in);
+        }
+        if(fd_out >= 0){
+            dup2(fd_out, STDOUT_FILENO);
+            close(fd_out);
+        }
     }
 
     execv(path.c_str(), child_argv);
@@ -187,6 +208,10 @@ pii determine_flags(int ntoken){
     case SYM_PIPE:
         file_flag = FILE_ELF;
         io_flag   = IOR_PIPE;
+        break;
+    case RUN_DAEMON:
+        io_flag = IOR_DAEMON;
+        break;
     }
     return std::make_pair(file_flag, io_flag);
 }
@@ -235,7 +260,7 @@ int transform_proc_info(ProcInfo& proc){
 }
 
 
-void execute_command(std::vector<ProcInfo> proces){
+void execute_command(std::vector<ProcInfo> proces, bool daemon=false){
     int plen = proces.size();
     std::vector<int> children_pids;
     std::vector<int> children_fds;
@@ -257,7 +282,11 @@ void execute_command(std::vector<ProcInfo> proces){
     while(idx >= 0){
         auto& proc = proces[idx];
         transform_proc_info(proc);
-        if(IO_ISOUT(proc.io_flag)){
+        if(IO_ISOUT(proc.io_flag) || IO_ISAPP(proc.io_flag)){
+            if(daemon){
+                std::cout << "No I/O allowed for daemon process\n";
+                return ;
+            }
             if(idx == plen - 1 || last_fd == -1){
                 std::cout << "Syntax error: Expected a file after `>`\n";
                 return ;
@@ -265,6 +294,10 @@ void execute_command(std::vector<ProcInfo> proces){
             fd_out = last_fd;
         }
         else if(IO_ISIN(proc.io_flag)){
+            if(daemon){
+                std::cout << "No I/O allowed for daemon process\n";
+                return ;
+            }
             if(idx == plen - 1 || last_fd == -1){
                 std::cout << "Syntax error: Expected a file after `<`\n";
                 return ;
@@ -272,6 +305,10 @@ void execute_command(std::vector<ProcInfo> proces){
             fd_in = last_fd;
         }
         else if(IO_ISPIPE(proc.io_flag)){
+            if(daemon){
+                std::cout << "No I/O allowed for daemon process\n";
+                return ;
+            }
             if(idx == plen - 1){
                 std::cout << "Syntax error: Expected a program after `|`\n";
                 return ;
@@ -299,11 +336,13 @@ void execute_command(std::vector<ProcInfo> proces){
                 fd_in  = chpipe.first;
                 last_pipe = chpipe;
                 _pid = fork();
+                running_children_cnt++;
                 if(_pid == 0){close(chpipe.second);}
             }
             else{
                 printf("Last pipe: %d <=> %d\n", last_pipe.first, last_pipe.second);
                 _pid = fork();
+                running_children_cnt++;
                 if(_pid == 0 && IO_ISPIPE(proc.io_flag)){
                     if(FLAG_DEBUG){
                         std::cout << "Piping out to " << last_pipe.second << '\n';
@@ -321,17 +360,31 @@ void execute_command(std::vector<ProcInfo> proces){
         else if(proc.file_flag == FILE_TXT){
             auto fname = proc.pname;
             auto mode = O_RDWR | O_CREAT;
-
+            if(FLAG_DEBUG){printf("IO flag: %d\n", proc.io_flag);}
             // File opened for input
-            if(idx > 0 && proces[idx-1].io_flag == IOR_IN){
+            if(idx > 0 && IO_ISIN(proces[idx-1].io_flag)){
                 if(access(fname.c_str(), F_OK) == -1){
                     std::cout << "An error occurred while opening " << fname << ":\n";
                     std::cout << strerror(errno) << '\n';
                     return ;
                 }
                 mode = O_RDONLY;
+                if(FLAG_DEBUG){
+                    printf("File %s opened for read only\n", fname.c_str());
+                }
             }
-
+            else if(idx > 0 && IO_ISAPP(proces[idx-1].io_flag)){
+                mode |= O_APPEND;
+                if(FLAG_DEBUG){
+                    printf("File %s opened for append mode\n", fname.c_str());
+                }
+            }
+            else{
+                mode |= O_TRUNC;
+                if(FLAG_DEBUG){
+                    printf("File %s opened for R/W\n", fname.c_str());
+                }
+            }
             int _fd = open(fname.c_str(), mode, 0664);
             if(_fd == -1){
                 std::cout << "An error occurred while opening " << fname << ":\n";
@@ -345,21 +398,44 @@ void execute_command(std::vector<ProcInfo> proces){
             args  = proc.args;
             break;
         }
+
         children_fds.push_back(chfd);
         idx--;
     }
 
     if(_pid == 0){
         close(main_pipe[0]);
-        execute_program(ppath, args, fd_in, fd_out);
+        if(daemon){
+            printf("Running daemon process (%d) with %s\n", getpid(), ppath.c_str());
+        }
+        execute_program(ppath, args, fd_in, fd_out, daemon);
     }
     else{
-        read_final_output(main_pipe[0], main_pipe[1]);
+        if(!daemon){
+            read_final_output(main_pipe[0], main_pipe[1]);
+        }
+        else{
+            if(FLAG_DEBUG){
+                std::cout << "Closing pipes for daemon process\n";
+            }
+            close(main_pipe[0]);
+            close(main_pipe[1]);
+            usleep(500000);
+        }
     }
     for(auto _fd:children_fds){
         if(_fd == -1){continue;}
         close(_fd);
     }
+    if(FLAG_DEBUG){std::cout << "Execution completed\n";}
+}
+
+std::string format_operand(std::string operand){
+    int len = operand.length();
+    if(operand[0] == '\"' && operand[len-1] == '\"'){
+        return operand.substr(1, len-2);
+    }
+    return operand;
 }
 
 void process_input(std::string input){
@@ -372,6 +448,7 @@ void process_input(std::string input){
     std::vector<int> io_flags;
 
     bool new_proc = true;
+    bool daemon = false;
     int f_len = 0;
     int cur_flag = FILE_ELF;
     do{
@@ -394,6 +471,7 @@ void process_input(std::string input){
                 file_flags.push_back(cur_flag);
             }
             else{
+                operand = format_operand(operand);
                 arguments[f_len-1].push_back(operand);
             }
             new_proc = false;
@@ -405,6 +483,9 @@ void process_input(std::string input){
                 cur_flag = _flags.first;
                 io_flags.push_back(_flags.second);
             }
+            else if(_flags.second == IOR_DAEMON){
+                daemon = true;
+            }
         }
     }while(ntoken);
     lex_clear_buffer();
@@ -414,7 +495,7 @@ void process_input(std::string input){
         procs.push_back(ProcInfo(files[i], arguments[i],
                                  file_flags[i], io_flags[i]));
     }
-    execute_command(procs);
+    execute_command(procs, daemon);
 }
 
 std::string get_user_input(){
@@ -441,6 +522,7 @@ std::string get_user_input(){
 int main(int argc, char* argv[]){
     while(FLAG_RUNNING){
         if(signal(SIGINT, sig_handler) == SIG_ERR){std::cout << "An error occurred while capturing SIGINT\n";}
+        //if(signal(SIGCHLD, sig_handler) == SIG_ERR){std::cout << "An error occurred while capturing SIGCHLD\n";}
         std::string input = get_user_input();
         process_input(input);
     }
