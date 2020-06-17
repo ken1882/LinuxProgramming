@@ -1,6 +1,5 @@
 %{
-#include "main.h"
-#include <stdio.h>
+#include "parser.tab.h"
 
 %}
 
@@ -11,9 +10,9 @@
 "<"                     {return RED_STDIN;}
 ">>"                    {return APP_STDOUT;}
 "\\"                    {return CONT_INPUT;}
-[\"][ _a-zA-z0-9]*[\"]  {return IDENTIFIER;}
+\"(\\.|[^"\\])*\"       {return CMD_IDENTIFIER;}
 [ \t\n]                 /* skip blanks */
-[~!@#\$%\^&*=\(\)\+\-\[\]\{\}\\\/\'\._a-zA-Z0-9]+     {return IDENTIFIER;}
+[~!@#\$%\^&*=\(\)\+\-\[\]\{\}\\\/\'\._a-zA-Z0-9]+     {return CMD_IDENTIFIER;}
 .                       {printf("Unexpected character: %s\n", yytext);}
 %%
 

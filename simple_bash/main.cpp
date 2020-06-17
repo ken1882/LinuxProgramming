@@ -1,6 +1,5 @@
 #include "main.h"
-#include <iostream>
-#include <cstdio>
+#include "parser.tab.h"
 #include <cstdlib>
 #include <cstring>
 #include <sys/types.h>
@@ -13,11 +12,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <stack>
-#include <vector>
 #include <algorithm>
-
-#define term_update() printf("\033[H\033[J")
-#define term_gotoxy(x, y) printf("\033[%d;%dH", x, y)
 
 typedef std::pair<int,int> pii;
 
@@ -26,9 +21,12 @@ extern int yylineno;
 extern char* yytext;
 extern void lex_scan_string(const char*);
 extern void lex_clear_buffer();
+extern int yyparse();
+extern int yyerror(char*);
 
 bool FLAG_RUNNING = true;
-bool FLAG_DEBUG   = true;
+bool FLAG_DEBUG   = false;
+bool FLAG_PARSE_OK = false;
 
 int running_children_cnt = 0;
 
@@ -65,7 +63,7 @@ void sig_handler(int signo){
     if(signo == SIGCHLD){
         wait(NULL);
         running_children_cnt -= 1;
-        printf("Running children: %d\n", running_children_cnt);
+        if(FLAG_DEBUG){printf("Running children: %d\n", running_children_cnt);}
     }
 }
 
@@ -288,7 +286,7 @@ void execute_command(std::vector<ProcInfo> proces, bool daemon=false){
                 return ;
             }
             if(idx == plen - 1 || last_fd == -1){
-                std::cout << "Syntax error: Expected a file after `>`\n";
+                std::cout << "Expected a file after `>`\n";
                 return ;
             }
             fd_out = last_fd;
@@ -299,7 +297,7 @@ void execute_command(std::vector<ProcInfo> proces, bool daemon=false){
                 return ;
             }
             if(idx == plen - 1 || last_fd == -1){
-                std::cout << "Syntax error: Expected a file after `<`\n";
+                std::cout << "Expected a file after `<`\n";
                 return ;
             }
             fd_in = last_fd;
@@ -310,18 +308,18 @@ void execute_command(std::vector<ProcInfo> proces, bool daemon=false){
                 return ;
             }
             if(idx == plen - 1){
-                std::cout << "Syntax error: Expected a program after `|`\n";
+                std::cout << "Expected a program after `|`\n";
                 return ;
             }
             if(proc.file_flag == FILE_TXT){
                 if(idx == 0){
-                    std::cout << "Syntax error: Missing input file descriptor\n";
+                    std::cout << "Missing input file descriptor\n";
                     return ;
                 }
                 proces[idx-1].io_flag |= IOR_PIPE;
             }
         }
-
+        if(!FLAG_PARSE_OK){return;}
         pii chpipe = std::make_pair(-1, -1);
         int chfd   = -1;
         if(proc.file_flag == FILE_ELF){
@@ -340,7 +338,7 @@ void execute_command(std::vector<ProcInfo> proces, bool daemon=false){
                 if(_pid == 0){close(chpipe.second);}
             }
             else{
-                printf("Last pipe: %d <=> %d\n", last_pipe.first, last_pipe.second);
+                if(FLAG_DEBUG){printf("Last pipe: %d <=> %d\n", last_pipe.first, last_pipe.second);}
                 _pid = fork();
                 running_children_cnt++;
                 if(_pid == 0 && IO_ISPIPE(proc.io_flag)){
@@ -449,20 +447,29 @@ void process_input(std::string input){
 
     bool new_proc = true;
     bool daemon = false;
+    
     int f_len = 0;
     int cur_flag = FILE_ELF;
+    
+    CMD_FLAGS.clear();
+    FLAG_PARSE_OK = !yyparse();
+    if(FLAG_DEBUG){ std::cout << (FLAG_PARSE_OK ? "Parse ok\n" : "Parse failed\n"); }
+    lex_clear_buffer();
+    lex_scan_string(input.c_str());
+    
     do{
         ntoken = yylex();
         std::string operand = yytext;
         if(FLAG_DEBUG){
             std::cout << ntoken << ' ' << operand << '\n';
         }
-        if(ntoken == IDENTIFIER && operand == "exit"){FLAG_RUNNING = false; break;}
+        if(ntoken == CMD_IDENTIFIER && operand == "exit"){FLAG_RUNNING = false; break;}
         if(FLAG_DEBUG){
             printf("New proc: %d\n", new_proc);
             printf("Operand: %s\n", operand.c_str());
         }
-        if(ntoken == IDENTIFIER){
+        if(ntoken == CMD_IDENTIFIER){
+            operand = format_operand(operand);
             if(new_proc){
                 std::vector<std::string> arglist;
                 files.push_back(operand);
@@ -471,7 +478,6 @@ void process_input(std::string input){
                 file_flags.push_back(cur_flag);
             }
             else{
-                operand = format_operand(operand);
                 arguments[f_len-1].push_back(operand);
             }
             new_proc = false;
@@ -522,7 +528,7 @@ std::string get_user_input(){
 int main(int argc, char* argv[]){
     while(FLAG_RUNNING){
         if(signal(SIGINT, sig_handler) == SIG_ERR){std::cout << "An error occurred while capturing SIGINT\n";}
-        //if(signal(SIGCHLD, sig_handler) == SIG_ERR){std::cout << "An error occurred while capturing SIGCHLD\n";}
+        if(signal(SIGCHLD, sig_handler) == SIG_ERR){std::cout << "An error occurred while capturing SIGCHLD\n";}
         std::string input = get_user_input();
         process_input(input);
     }
